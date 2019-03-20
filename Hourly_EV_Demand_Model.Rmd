@@ -1,0 +1,378 @@
+---
+title: "Hourly EV Charging Demand Model"
+author: "Danny Ettelson"
+date: "11/27/2018"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r loadlib}
+
+#load libraries
+library(tidyverse)
+library(dplyr)
+library(RColorBrewer)
+
+
+#load data
+#Price Schedule
+rates <- read_csv("Model_Map/2018_Winter_TOU_EV_4.csv")
+
+#Price Schedule Options (All in Model_Map Folder)
+
+#2018 Summer 3
+#read_csv("Model_Map/2018_Summer_TOU_EV_3.csv")
+
+#2018 Summer 4
+#read_csv("Model_Map/2018_Summer_TOU_EV_4.csv")
+
+#2018 Winter 3
+#read_csv("Model_Map/2018_Winter_TOU_EV_3.csv")
+
+#2018 Winter 4
+#read_csv("Model_Map/2018_Winter_TOU_EV_4.csv")
+
+#2018 Winter D
+#read_csv("Model_Map/2018_Winter_TOU_EV_D.csv")
+
+#2019 Summer 8
+#read_csv("Model_Map/2019_Summer_TOU_EV_8.csv")
+
+#2019 Winter 8
+#read_csv("Model_Map/2019_Winter_TOU_EV_8.csv")
+
+
+#Baseline Usage
+baseline <- read_csv("Model_Map/03-18_WP_Avg.csv")
+
+
+# Number of Chargers by Segment
+#chargers <- read_csv("Model_Map/Chargers_Installed_03-18.csv")
+Chargers <- read_csv("Model_Map/Chargers.csv")
+
+
+#Elasticities with format 9X3 with columns Base_Hr, Changed_Hr, and Elasticity
+#Changed_Hr is the Hour where the price change occurs, Base_Hr is the hour in which demand changes
+Elasticities <- read_csv("SDGE_Elasticities.csv")
+SDGE_P_SOP_Ratios <- read_csv("SDGE_P_SOP_Ratios.csv")
+```
+
+
+```{r Context}
+
+#Price Schedule
+price_schedule <- data.frame(Hr = c(1:24)) %>% 
+  mutate(P0 = rates$P0) %>% 
+  mutate(period = rates$Period)
+
+#Ratio for selecting Elasticities
+P_SOP_Ratio <- max(price_schedule$P0)/min(price_schedule$P0)
+
+#Matches our closest Ratio to Inputted Ratio
+closest_schedule <- SDGE_P_SOP_Ratios$Rate_Schedule[which.min(abs(SDGE_P_SOP_Ratios$P_SOP_Ratio - P_SOP_Ratio))]
+
+#Uses Elasticities of rate schedule with closest ratio
+Best_Elasticities <- select(Elasticities, Base_Hr = Base_Hr, Changed_Hr = Changed_Hr, Elasticity = closest_schedule)
+
+#price_schedule$period <- factor(price_schedule$period, levels = c("P","MP","OP"))
+
+#Baseline
+#WP_Chargers <- chargers$Workplace #Number of Chargers (C)
+EV_Demand <- mutate(price_schedule, Xi = baseline$Xi, X0 = baseline$Xi/baseline$C[1]*chargers$Workplace ) #340 here comes from the number of chargers installed for the baseline
+
+
+```
+
+```{r Max_Theoretical}
+
+#Theoretical max is based on the current number of chargers in the SCE Charge Ready pilot program, multiplied by the average power rating of Level 2 EV chargers (6.6 kW), multiplied by 1 hour.  This gives us the total number of kWh for each hour that could be achieved if every charger were utilized during the target load shift window of 11 AM - 3 PM.
+
+Number_Chargers <- 1020
+Charger_Power_Rating <- 6.6
+Max_Theory <- Number_Chargers*Charger_Power_Rating
+
+Max_Theory_df <- data.frame(Hour=c(12:15), kWh=Max_Theory)
+
+
+```
+
+
+```{r Splining}
+
+x <- c(1:24) #used for the 24 hours in for loops (24 elasticity columns)
+
+
+#This makes a table for each hour that lists the midpoint hours that will be splined, hours as <24, rate period, and elasticity relative to the hour.
+
+
+#Finds the hours in the rate schedule just before the period changes
+change_points <- which(price_schedule$period != dplyr::lag(price_schedule$period)) - 1
+
+#Finds the midpoints of each "chunk" of rate periods unless the "chunk" spans over the end of the day
+mid_points <- change_points[-length(change_points)] +diff(change_points)/2
+
+#finds the midpoint of the "chunk" of rate period that spans over the end of the day
+rollover_midpoint <- (change_points[1]+24 + change_points[length(change_points)])/2 -24
+
+#adds rollover_midpoint but only if there is actually a rate period "chunk" that rolls over the day
+if(price_schedule$period[1] == price_schedule$period[length(price_schedule$period)]) {
+  mid_points <- append(mid_points, rollover_midpoint)
+}
+  
+  
+for(i in x) {
+    nam <- paste("Midpoints", i, sep = ".")
+    
+    Hrs <- append(mid_points, i)
+    Hrs <- Hrs[-match(price_schedule$period[i],price_schedule$period[mid_points])]
+#The loop above selects a set of midpoints that leaves out one midpoint based on the hour that a table is being made for (it excludes the midpoint that is in the same period as the hour of the table)
+
+    Hrs24 <- append(Hrs,i) #adds the end point (the starting hour 24 hours later)
+    Hrs <- if_else(Hrs<i,Hrs+24,Hrs) %>% 
+      append(i+24)
+    #lists "real hours" from the starting point, adding 24 to any hours before the start point
+    
+    periods <- price_schedule$period[c(Hrs24)] 
+    #retrieves the rate periods of each hour listed
+    
+    own_period <- price_schedule$period[i]
+    #retrieves rate period of the current hour
+    
+    own_period_elasticities <- filter(Best_Elasticities, Base_Hr == own_period)
+    midpoint_elasticities <- own_period_elasticities$Elasticity[match(periods, Elasticities$Changed_Hr)]
+
+    
+    assign(nam,data.frame(Hour=Hrs,Hrs24=Hrs24, Period=periods,Elasticity = midpoint_elasticities))
+    #makes a data frame named after the current hour with each of the above variables
+    
+}
+
+for (i in x) {
+  current_hr <- eval(parse(text = sub("XX", i, "Midpoints.XX")))
+  #calls current hours midpoint table
+  
+  Y = spline(x=current_hr$Hour,y=current_hr$Elasticity,xout=seq(min(current_hr$Hour),max(current_hr$Hour)))
+  #splines elasticities to smoooth
+  
+  HR = Y$x
+  
+  ELAST = Y$y
+  
+  nam <- paste("Elasticities", i, sep = ".")
+  
+  assign(nam,data.frame(HR=HR,ELAST=ELAST,HR24 = if_else(HR<=24,HR,HR-24)))
+  #makes a data frame with above variables: Hours, smoothed elasticities
+}
+
+
+```
+
+
+
+```{r Matrix}
+
+#creates our matrix based on the 24 smoothed elasticities for each hour.
+#uses a for loop to call files rather than individually
+#NOTE this matrix has each COLUMN to be used for each hour. Our excel used each ROW if trying to compare.
+
+matrix <- data.frame(Hr = c(1:24))
+for (i in x) {
+  El <- eval(parse(text = sub("YY", i, "Elasticities.YY")))
+  El <- El[-1,]
+  El <- El[order(El$HR24),]
+  matrix <- cbind(matrix, El$ELAST)
+}
+matrix<-matrix[,-1]
+colnames(matrix) <- c(1:24)
+```
+
+
+
+```{r Intervention}
+
+price_change <- -0.05
+intervention_hours <- c(12:15)
+EV_Demand <- mutate(EV_Demand, P1 = price_schedule$P0) #Adds price schedule with intervention (P1)
+
+EV_Demand$P1[intervention_hours] <-EV_Demand$P1[intervention_hours] + price_change #updates intervention column to implement intervention
+
+EV_Demand <- mutate(EV_Demand, P1p = (P1-P0)/P0) #Adds percentage change in price (P1p)
+
+X1p <- as.vector(0)
+for (val in x) {
+  mat <- sub("XX",val, "matrix$`XX`")
+  sum_prod <- crossprod(EV_Demand$P1p,eval(parse(text = mat)))
+  X1p<- append(X1p,sum_prod)
+  
+} #crossprod() multiplies sumproduct of the percent change in price with each column in the matrix. This is done 24 times by the for loop rather than 24 individual times
+
+X1p <- X1p[-1] # gets rid of the first dummy entry to the variable
+EV_Demand <- mutate(EV_Demand, X1p = X1p) #add percent change in demand due to price onto EV_Demand (X1p)
+
+EV_Demand <- mutate(EV_Demand, X1 = (1+X1p)*X0) #adds new demand in kW variable (X1)
+
+
+```
+
+```{r Throttling}
+
+throttle_amount <- 0 #throttling amount -0.5 - 50%
+Tp <- rep(0,24)
+throttle_hours <- c(7:11) #hours that throttling occurs
+Tp[throttle_hours] <- throttle_amount #Assigns each hour a throttling percentage
+EV_Demand <- mutate(EV_Demand, Tp=Tp) #Adds throttling percentage to each hour (Tp)
+
+E <- as.vector(0) #dummy for self-elasticities (E)
+
+for (val in x) {
+  self <- matrix[val,val]
+  E <- append(E,self)
+} #checks the matrix for the self elasticity and adds it to a vector, repeated 24 times as a for loop rather than 24 times
+
+E <- E[-1] #removing dummy
+
+EV_Demand <- mutate(EV_Demand, Ptp = Tp/E, Pt = (1+Ptp)*P1)#Creates an equivalent change in price during that hour that would be required to see the drop in demand due to throttling
+
+Xtp <- as.vector(0) #Dummy for change in demand due to throttling (Xtp)
+
+for (val in x) {
+  mat <- sub("XX",val, "matrix$`XX`")
+  sum_prod <- crossprod(EV_Demand$Ptp,eval(parse(text = mat)))
+  Xtp<- append(Xtp,sum_prod)
+} #uses new price equivalent sumproduct with each hour's elasticities to find percent change in demand due to throttling
+Xtp <- Xtp[-1] #gets rid of dummy
+
+EV_Demand <- mutate(EV_Demand, Xtp = Xtp, Xt = (Xtp+1)*X1) #adds (Xtp) and the new demand in kW due to throttling (Xt)
+#line below replaces negative demand with 0
+#EV_Demand$Xt <- if_else(EV_Demand$Xt >= 0, EV_Demand$Xt, 0)
+
+
+#The variables below quantify the shift and net change in demand as a result of interventions, and need to be adjusted based on intervention (does not count throttling)
+Total_x0 <- sum(EV_Demand$X0)
+Total_xt <-sum(EV_Demand$Xt)
+
+Net_Change <- Total_xt-Total_x0
+Change_intervention <- sum(EV_Demand$Xt[intervention_hours]) - sum(EV_Demand$X0[intervention_hours])
+Change_outside_intervention <- sum(EV_Demand$Xt[-intervention_hours])- sum(EV_Demand$X0[-intervention_hours])
+
+```
+
+```{r Communication}
+
+#to be completed...
+
+```
+
+
+```{r Outputs}
+
+#Load Emissions Factors
+Hourly_EF <- read_csv("Hrly_EF.csv")
+# Current hourly EF csv is fake. Numbers will be in lbs/kwh for both CO2 and NOX.
+
+#Create Date Frame for Emissions Outputs
+
+Emissions <- data.frame(Hr = c(1:24)) %>% 
+  mutate(CO2EF = Hourly_EF$CO2) %>% 
+  mutate(NOXEF = Hourly_EF$NOX) %>% 
+  mutate(X0 = EV_Demand$X0) %>% # column for initial demand at each hour
+  mutate(Xf = EV_Demand$Xt)  # column for new demand at each hour. we'll need to update "Xt" to reflect the new column post comms/all interventions
+
+#calculate emissions for base and new demand
+Emissions <- Emissions %>%
+  mutate (CO2base = X0*CO2EF) %>% 
+  mutate (NOXbase = X0*NOXEF) %>% 
+  mutate (CO2new = Xf*CO2EF) %>% 
+  mutate (NOXnew = Xf*NOXEF) %>% 
+  mutate (Xchange = Xf-X0) %>% 
+  mutate (CO2change = Xchange*CO2EF) %>% 
+  mutate (NOXchange = Xchange*NOXEF)
+  
+
+#Sum base emissions by period (11-3, 4-9pm, other)
+CO2base_1115 <- sum(Emissions$CO2base[12:15])
+NOXbase_1115 <- sum(Emissions$NOXbase[12:15])
+CO2base_1621 <- sum(Emissions$CO2base[17:21])
+NOXbase_1621 <- sum(Emissions$NOXbase[17:21])
+CO2base_other <- sum(Emissions$CO2base[21:24], Emissions$CO2base[1:11],Emissions$CO2base[16])
+NOXbase_other <- sum(Emissions$NOXbase[16:24], Emissions$NOXbase[1:11],Emissions$NOXbase[16])
+CO2base_sum <- sum(Emissions$CO2base)
+NOXbase_sum <- sum(Emissions$NOXbase)
+
+#Sum new emissions by period (11-3, 4-9pm, other)
+CO2new_1115 <- sum(Emissions$CO2new[12:15])
+NOXnew_1115 <- sum(Emissions$NOXnew[12:15])
+CO2new_1621 <- sum(Emissions$CO2new[17:21])
+NOXnew_1621 <- sum(Emissions$NOXnew[17:21])
+CO2new_other <- sum(Emissions$CO2new[21:24], Emissions$CO2new[1:11],Emissions$CO2new[16])
+NOXnew_other <- sum(Emissions$NOXnew[16:24], Emissions$NOXnew[1:11],Emissions$NOXnew[16])
+CO2new_sum <- sum(Emissions$CO2new)
+NOXnew_sum <- sum(Emissions$NOXnew)
+
+
+#Put into new df
+Emissions_Table <- data.frame("Time"= c("11am-3pm", "4pm-9pm", "Other Times", "Total"), "BaseCO2" = c(CO2base_1115,CO2base_1621,CO2base_other, CO2base_sum), "NewCO2" = c(CO2new_1115,CO2new_1621,CO2new_other, CO2new_sum), "BaseNOX" = c(NOXbase_1115, NOXbase_1621,NOXbase_other, NOXbase_sum), "NewNOX" = c(NOXnew_1115, NOXnew_1621,NOXnew_other, NOXnew_sum))
+
+#Find differences
+Emissions_Table <- Emissions_Table %>% 
+  mutate(ChangeCO2 = NewCO2-BaseCO2) %>% 
+  mutate (ChangeNOX = NewNOX-BaseNOX)
+
+#curtailment cost: to be added
+
+
+```
+
+
+```{r Figures}
+
+#need to stack both demand curves in one data frame for a legend
+
+graph_table <- EV_Demand[c(1,5,14)] %>% 
+  gather(condition,value,X0:Xt) %>% 
+  mutate(Theoretical_Max=Max_Theory)
+
+
+Demand_Graph <- ggplot(data = graph_table, aes(x = Hr)) +
+  geom_line(aes(y = value, color=condition)) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black")) +
+  labs(title="Hourly Demand Forecast", 
+       subtitle="$0.05 Discount 11 AM - 3 PM",
+       y="EV Charging Demand (kW)",
+       x="Hour",
+       color=NULL) +
+  scale_x_continuous(breaks = 1:24, limits = c(1,24), expand = c(0, 0)) +
+  scale_color_manual(labels=c("Baseline Demand","Demand with Intervention"), values = c("blue", "red")) +
+  #geom_rect(aes(xmin=6,xmax=11,ymin=-Inf,ymax=Inf,fill="Throttle"),alpha=0.0075) +
+  geom_rect(aes(xmin=11,xmax=15,ymin=-Inf,ymax=Inf, fill = "Discount"),alpha=0.0075) +
+  #theme_bw() + # theme_bw() gives grid lines, could remove
+  theme(plot.title = element_text(hjust = 0.5)) + 
+  theme(plot.subtitle = element_text(hjust = 0.5))+
+ theme(legend.position="bottom") +
+  scale_fill_manual('Interventions',values = c('green','yellow'),  guide = guide_legend(override.aes = list(alpha = 0.15)))
+
+Potential_Graph <- Demand_Graph +
+  geom_segment(aes(y=Theoretical_Max, yend=Theoretical_Max, x=11, xend=15))
+  
+# \n 50% Throttling 6 AM - 11 AM label for throttling
+# Aesthetic Notes:
+# might try to remove space b/w Y-axis and hr0, as well as past hr24
+# bold axis titles
+# color brewer
+# geom_line(aes(y=Theoretical_Max, x=11:15)) +
+
+# If we want to graph the Max Theoretical Segment, we can use this:
+# geom_segment(aes(y=Theoretical_Max, yend=Theoretical_Max, x=11, xend=15))
+
+
+Demand_Graph
+Potential_Graph
+
+```
+
